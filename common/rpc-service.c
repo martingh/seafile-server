@@ -5293,6 +5293,45 @@ seafile_org_get_shared_users_by_repo (int org_id,
                                                             org_id, repo_id);
 }
 
+/* Resumable file upload. */
+
+gint64
+seafile_get_upload_tmp_file_offset (const char *repo_id, const char *file_path,
+                                    GError **error)
+{
+    if (!repo_id || !is_uuid_valid(repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo id");
+        return -1;
+    }
+
+    int path_len;
+    if (!file_path || (path_len = strlen(file_path)) == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid file path");
+        return -1;
+    }
+
+    char *rfile_path;
+    if (file_path[0] != '/') {
+        rfile_path = g_strconcat ("/", file_path, NULL);
+        path_len += 1;
+    } else {
+        rfile_path = g_strdup (file_path);
+    }
+
+    while (path_len > 1 && rfile_path[path_len - 1] == '/') {
+        rfile_path[path_len - 1] = '\0';
+        path_len--;
+    }
+
+    gint64 ret = seaf_repo_manager_get_upload_tmp_file_offset (seaf->repo_mgr, repo_id,
+                                                               rfile_path, error);
+    g_free (rfile_path);
+
+    return ret;
+}
+
 char *
 seafile_convert_repo_path (const char *repo_id,
                            const char *path,

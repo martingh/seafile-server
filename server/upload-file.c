@@ -78,12 +78,19 @@ typedef struct RecvFSM {
     char *token_type; /* For sending statistic type */
 
     gboolean need_idx_progress;
+
+    gint64 rstart;
+    gint64 rend;
+    gint64 fsize;
 } RecvFSM;
 
 #define MAX_CONTENT_LINE 10240
 
 static GHashTable *upload_progress;
 static pthread_mutex_t pg_lock;
+static int
+append_block_data_to_tmp_file (RecvFSM *fsm, const char *parent_dir,
+                               const char *file_name);
 
 /* IE8 will set filename to the full path of the uploaded file.
  * So we need to strip out the basename from it.
@@ -165,6 +172,24 @@ send_redirect_reply (evhtp_request_t *req)
         req->headers_out,
         evhtp_header_new("Content-Type", "text/html; charset=utf-8", 1, 1));
     evhtp_send_reply(req, EVHTP_RES_SEEOTHER);
+}
+
+static void
+send_success_reply_ie8_compatible (evhtp_request_t *req, evhtp_res code)
+{
+    set_content_length_header (req);
+
+    const char *accept = evhtp_kv_find (req->headers_in, "Accept");
+    if (accept && strstr (accept, "application/json") != NULL) {
+        evhtp_headers_add_header (
+            req->headers_out,
+            evhtp_header_new("Content-Type", "application/json; charset=utf-8", 1, 1));
+    } else {
+        evhtp_headers_add_header (
+            req->headers_out,
+            evhtp_header_new("Content-Type", "text/plain", 1, 1));
+    }
+    evhtp_send_reply (req, code);
 }
 
 static void
@@ -516,8 +541,10 @@ file_id_list_from_json (const char *ret_json)
 static void
 upload_api_cb(evhtp_request_t *req, void *arg)
 {
+    printf ("Mydebug %s\n", __FUNCTION__);
     RecvFSM *fsm = arg;
     char *parent_dir, *replace_str;
+    char *relative_path = NULL, *new_parent_dir = NULL;
     GError *error = NULL;
     int error_code = ERROR_INTERNAL;
     char *filenames_json, *tmp_files_json;
@@ -552,7 +579,7 @@ upload_api_cb(evhtp_request_t *req, void *arg)
     if (!fsm || fsm->state == RECV_ERROR)
         return;
 
-    if (!fsm->files) {
+    if (!fsm->filenames) {
         seaf_debug ("[upload] No file uploaded.\n");
         send_error_reply (req, EVHTP_RES_BADREQ, "No file.\n");
         return;
@@ -573,14 +600,65 @@ upload_api_cb(evhtp_request_t *req, void *arg)
         send_error_reply (req, EVHTP_RES_BADREQ, "Invalid URL.\n");
         return;
     }
+    relative_path = g_hash_table_lookup (fsm->form_kvs, "relative_path");
+    if (relative_path != NULL) {
+        if (relative_path[0] == '/' || relative_path[0] == '\\') {
+            seaf_warning ("Invalid relative path %s.\n", relative_path);
+            send_error_reply (req, EVHTP_RES_BADREQ, "Invalid relative path.");
+            return;
+        }
+        char *tmp_p = get_canonical_path(parent_dir);
+        char *tmp_r = get_canonical_path(relative_path);
+        new_parent_dir = g_build_path("/", tmp_p, tmp_r, NULL);
+        g_free(tmp_p);
+        g_free(tmp_r);
+    } else {
+        new_parent_dir = get_canonical_path(parent_dir);
+    }
+
+    if (fsm->rstart >= 0) {
+        if (fsm->filenames->next) {
+            seaf_debug ("[upload] Breakpoint transfer only support one file in one request.\n");
+            send_error_reply (req, EVHTP_RES_BADREQ, "More files in one request.\n");
+            goto out;
+        }
+
+        if (parent_dir[0] != '/') {
+            seaf_debug ("[upload] Invalid parent dir, should start with /.\n");
+            send_error_reply (req, EVHTP_RES_BADREQ, "Invalid parent dir.\n");
+            goto out;
+        }
+
+        if (append_block_data_to_tmp_file (fsm, new_parent_dir,
+                                           (char *)fsm->filenames->data) < 0) {
+            error_code = ERROR_INTERNAL;
+            goto error;
+        }
+        if (fsm->rend != fsm->fsize - 1) {
+            const char *success_str = "{\"success\": true}";
+            evbuffer_add (req->buffer_out, success_str, strlen(success_str));
+            send_success_reply_ie8_compatible (req, EVHTP_RES_OK);
+            goto out;
+        }
+    }
+
+    if (!fsm->files) {
+        seaf_debug ("[upload] No file uploaded.\n");
+        send_error_reply (req, EVHTP_RES_BADREQ, "No file.\n");
+        goto out;
+    }
 
     if (!check_parent_dir (req, fsm->repo_id, parent_dir))
-        return;
+        goto out;
 
     if (!check_tmp_file_list (fsm->files, &error_code))
         goto error;
 
-    gint64 content_len = get_content_length(req);
+    gint64 content_len;
+    if (fsm->fsize > 0)
+        content_len = fsm->fsize;
+    else
+        content_len = get_content_length (req);
     if (seaf_quota_manager_check_quota_with_delta (seaf->quota_mgr,
                                                    fsm->repo_id,
                                                    content_len) != 0) {
@@ -648,9 +726,27 @@ upload_api_cb(evhtp_request_t *req, void *arg)
         oper = "link-file-upload";
     send_statistic_msg(fsm->repo_id, fsm->user, oper, (guint64)content_len);
 
+    if (fsm->rstart >= 0 && fsm->rend == fsm->fsize - 1) {
+        // File upload success, try to remove tmp file from WebUploadTmpFile table
+        char *abs_path;
+
+        if (new_parent_dir[strlen(new_parent_dir) - 1] == '/') {
+            abs_path = g_strconcat (new_parent_dir, (char *)fsm->filenames->data, NULL);
+        } else {
+            abs_path = g_strconcat (new_parent_dir, "/", (char *)fsm->filenames->data, NULL);
+        }
+
+        seaf_repo_manager_del_upload_tmp_file (seaf->repo_mgr, fsm->repo_id, abs_path, NULL);
+        g_free (abs_path);
+    }
+
+out:
+    g_free(new_parent_dir);
+
     return;
 
 error:
+    g_free(new_parent_dir);
     switch (error_code) {
     case ERROR_FILENAME:
         send_error_reply (req, SEAF_HTTP_RES_BADFILENAME, "Invalid filename.\n");
@@ -1000,6 +1096,118 @@ error:
 /*     } */
 /* } */
 
+static int
+copy_block_to_tmp_file (int blk_fd, int tmp_fd)
+{
+    if (lseek(blk_fd, 0, SEEK_SET) < 0) {
+        seaf_warning ("Failed to rewind block temp file position to start: %s\n",
+                      strerror(errno));
+        return -1;
+    }
+
+    char buf[8192];
+    int buf_len = sizeof(buf);
+    ssize_t len;
+
+    while (TRUE) {
+        len = readn (blk_fd, buf, buf_len);
+        if (len < 0) {
+            seaf_warning ("Failed to read content from block temp file: %s.\n",
+                          strerror(errno));
+            return -1;
+        } else if (len == 0) {
+            return 0;
+        }
+
+        if (writen (tmp_fd, buf, len) != len) {
+            seaf_warning ("Failed to write content to temp file: %s.\n",
+                          strerror(errno));
+            return -1;
+        }
+    }
+}
+
+static int
+append_block_data_to_tmp_file (RecvFSM *fsm, const char *parent_dir,
+                               const char *file_name)
+{
+    char *abs_path;
+    char *temp_file = NULL;
+    GError *error = NULL;
+    int tmp_fd = -1;
+    int ret = 0;
+    HttpServerStruct *htp_server = seaf->http_server;
+    int cluster_shared_temp_file_mode = htp_server->cluster_shared_temp_file_mode;
+
+    if (parent_dir[strlen(parent_dir) - 1] == '/') {
+        abs_path = g_strconcat (parent_dir, file_name, NULL);
+    } else {
+        abs_path = g_strconcat (parent_dir, "/", file_name, NULL);
+    }
+
+    temp_file = seaf_repo_manager_get_upload_tmp_file (seaf->repo_mgr,
+                                                       fsm->repo_id,
+                                                       abs_path, &error);
+    if (error) {
+        seaf_warning ("%s\n", error->message);
+        g_clear_error (&error);
+        ret = -1;
+        goto out;
+    }
+
+    if (!temp_file) {
+        temp_file = g_strdup_printf ("%s/cluster-shared/%sXXXXXX",
+                                     seaf->http_server->http_temp_dir,
+                                     file_name);
+        tmp_fd = g_mkstemp_full (temp_file, O_RDWR, cluster_shared_temp_file_mode);
+        if (tmp_fd >= 0) {
+            if (seaf_repo_manager_add_upload_tmp_file (seaf->repo_mgr,
+                                                       fsm->repo_id,
+                                                       abs_path, temp_file,
+                                                       &error) < 0) {
+                seaf_warning ("%s\n", error->message);
+                g_clear_error (&error);
+                close (tmp_fd);
+                g_unlink (temp_file);
+                tmp_fd = -1;
+                ret = -1;
+                goto out;
+            }
+        }
+    } else {
+        tmp_fd = g_open (temp_file, O_WRONLY | O_APPEND);
+    }
+
+    if (tmp_fd < 0) {
+        seaf_warning ("Failed to open upload temp file: %s.\n", strerror(errno));
+        ret = -1;
+        goto out;
+    }
+
+    if (copy_block_to_tmp_file (fsm->fd, tmp_fd) < 0) {
+        ret = -1;
+        goto out;
+    }
+
+    if (fsm->rend == fsm->fsize - 1) {
+        // For the last block, record tmp_files for upload to seafile and remove
+        fsm->tmp_files = g_list_prepend (fsm->tmp_files, g_strdup(temp_file)); // for cleaning up
+        fsm->files = g_list_prepend (fsm->files, g_strdup(temp_file)); // for virus checking, indexing...
+    }
+
+out:
+    g_free (abs_path);
+    if (tmp_fd >= 0) {
+        close (tmp_fd);
+    }
+    g_free (temp_file);
+    close (fsm->fd);
+    g_unlink (fsm->tmp_file);
+    g_free (fsm->tmp_file);
+    fsm->tmp_file = NULL;
+
+    return ret;
+}
 /*
   Handle AJAX file upload.
   @return an array of json data, e.g. [{"name": "foo.txt"}]
@@ -1007,8 +1215,9 @@ error:
 static void
 upload_ajax_cb(evhtp_request_t *req, void *arg)
 {
+    printf ("Mydebug %s\n", __FUNCTION__);
     RecvFSM *fsm = arg;
-    char *parent_dir;
+    char *parent_dir = NULL, *relative_path = NULL, *new_parent_dir = NULL;
     GError *error = NULL;
     int error_code = ERROR_INTERNAL;
     char *filenames_json, *tmp_files_json;
@@ -1042,12 +1251,6 @@ upload_ajax_cb(evhtp_request_t *req, void *arg)
     if (!fsm || fsm->state == RECV_ERROR)
         return;
 
-    if (!fsm->files) {
-        seaf_debug ("[upload] No file uploaded.\n");
-        send_error_reply (req, EVHTP_RES_BADREQ, "No file.\n");
-        return;
-    }
-
     parent_dir = g_hash_table_lookup (fsm->form_kvs, "parent_dir");
     if (!parent_dir) {
         seaf_debug ("[upload] No parent dir given.\n");
@@ -1055,13 +1258,72 @@ upload_ajax_cb(evhtp_request_t *req, void *arg)
         return;
     }
 
-    if (!check_parent_dir (req, fsm->repo_id, parent_dir))
+    if (!fsm->filenames) {
+        seaf_debug ("[upload] No file uploaded.\n");
+        send_error_reply (req, EVHTP_RES_BADREQ, "No file.\n");
         return;
+    }
+
+    relative_path = g_hash_table_lookup (fsm->form_kvs, "relative_path");
+    if (relative_path != NULL) {
+        if (relative_path[0] == '/' || relative_path[0] == '\\') {
+            seaf_warning ("Invalid relative path %s.\n", relative_path);
+            send_error_reply (req, EVHTP_RES_BADREQ, "Invalid relative path.");
+            return;
+        }
+        char *tmp_p = get_canonical_path(parent_dir);
+        char *tmp_r = get_canonical_path(relative_path);
+        new_parent_dir = g_build_path("/", tmp_p, tmp_r, NULL);
+        g_free(tmp_p);
+        g_free(tmp_r);
+    } else {
+        new_parent_dir = get_canonical_path(parent_dir);
+    }
+
+    if (fsm->rstart >= 0) {
+        if (fsm->filenames->next) {
+            seaf_debug ("[upload] Breakpoint transfer only support one file in one request.\n");
+            send_error_reply (req, EVHTP_RES_BADREQ, "More files in one request.\n");
+            goto out;
+        }
+
+        if (parent_dir[0] != '/') {
+            seaf_debug ("[upload] Invalid parent dir, should start with /.\n");
+            send_error_reply (req, EVHTP_RES_BADREQ, "Invalid parent dir.\n");
+            goto out;
+        }
+
+        if (append_block_data_to_tmp_file (fsm, new_parent_dir,
+                                           (char *)fsm->filenames->data) < 0) {
+            error_code = ERROR_INTERNAL;
+            goto error;
+        }
+        if (fsm->rend != fsm->fsize - 1) {
+            const char *success_str = "{\"success\": true}";
+            evbuffer_add (req->buffer_out, success_str, strlen(success_str));
+            send_success_reply_ie8_compatible (req, EVHTP_RES_OK);
+            goto out;
+        }
+    }
+
+    if (!fsm->files) {
+        seaf_debug ("[upload] No file uploaded.\n");
+        send_error_reply (req, EVHTP_RES_BADREQ, "No file.\n");
+        goto out;
+    }
+
+    if (!check_parent_dir (req, fsm->repo_id, parent_dir))
+        goto out;
 
     if (!check_tmp_file_list (fsm->files, &error_code))
         goto error;
 
-    gint64 content_len = get_content_length (req);
+    gint64 content_len;
+    if (fsm->fsize > 0)
+        content_len = fsm->fsize;
+    else
+        content_len = get_content_length (req);
+
     if (seaf_quota_manager_check_quota_with_delta (seaf->quota_mgr,
                                                    fsm->repo_id,
                                                    content_len) != 0) {
@@ -1114,29 +1376,34 @@ upload_ajax_cb(evhtp_request_t *req, void *arg)
     }
     g_free (ret_json);
 
-    // send_success_reply (req);
-    set_content_length_header (req);
+    if (fsm->rstart >= 0 && fsm->rend == fsm->fsize - 1) {
+        // File upload success, try to remove tmp file from WebUploadTmpFile table
+        char *abs_path;
 
-    const char *accept = evhtp_kv_find (req->headers_in, "Accept");
-    if (accept && strstr (accept, "application/json") != NULL) {
-        evhtp_headers_add_header (
-            req->headers_out,
-            evhtp_header_new("Content-Type", "application/json; charset=utf-8", 1, 1));
-    } else {
-        evhtp_headers_add_header (
-            req->headers_out,
-            evhtp_header_new("Content-Type", "text/plain", 1, 1));
+        if (new_parent_dir[strlen(new_parent_dir) - 1] == '/') {
+            abs_path = g_strconcat (new_parent_dir, (char *)fsm->filenames->data, NULL);
+        } else {
+            abs_path = g_strconcat (new_parent_dir, "/", (char *)fsm->filenames->data, NULL);
+        }
+
+        seaf_repo_manager_del_upload_tmp_file (seaf->repo_mgr, fsm->repo_id, abs_path, NULL);
+        g_free (abs_path);
     }
-    evhtp_send_reply (req, EVHTP_RES_OK);
+
+    send_success_reply_ie8_compatible (req, EVHTP_RES_OK);
 
     char *oper = "web-file-upload";
     if (g_strcmp0(fsm->token_type, "upload-link") == 0)
         oper = "link-file-upload";
     send_statistic_msg(fsm->repo_id, fsm->user, oper, (guint64)content_len);
 
+out:
+    g_free (new_parent_dir);
+
     return;
 
 error:
+    g_free(new_parent_dir);
     switch (error_code) {
     case ERROR_FILENAME:
         send_error_reply (req, SEAF_HTTP_RES_BADFILENAME, "Invalid filename.");
@@ -2252,6 +2519,56 @@ check_access_token (const char *token,
     return 0;
 }
 
+static gboolean
+parse_range_val (evhtp_headers_t *hdr, gint64 *rstart,
+                 gint64 *rend, gint64 *rfsize)
+{
+    const char *tmp = evhtp_kv_find (hdr, "Content-Range");
+    if (!tmp)
+        return TRUE;
+
+    char *next = NULL;
+    gint64 start;
+    gint64 end;
+    gint64 fsize;
+
+    if (strstr (tmp, "bytes") != tmp) {
+        return FALSE;
+    }
+
+    tmp += strlen("bytes");
+    while (tmp && *tmp == ' ') {
+        tmp++;
+    }
+
+    start = strtoll (tmp, &next, 10);
+    if ((start == 0 && next == tmp) || *next != '-') {
+        return FALSE;
+    }
+
+    tmp = next + 1;
+    end = strtoll (tmp, &next, 10);
+    if ((end == 0 && next == tmp) || *next != '/') {
+        return FALSE;
+    }
+
+    tmp = next + 1;
+    fsize = strtoll (tmp, &next, 10);
+    if ((fsize == 0 && next == tmp) || *next != '\0') {
+        return FALSE;
+    }
+
+    if (start > end || end >= fsize) {
+        return FALSE;
+    }
+
+    *rstart = start;
+    *rend = end;
+    *rfsize = fsize;
+
+    return TRUE;
+}
+
 static int
 get_progress_info (evhtp_request_t *req,
                    evhtp_headers_t *hdr,
@@ -2332,11 +2649,23 @@ upload_headers_cb (evhtp_request_t *req, evhtp_headers_t *hdr, void *arg)
         pthread_mutex_unlock (&pg_lock);
     }
 
+    gint64 rstart = -1;
+    gint64 rend = -1;
+    gint64 fsize = -1;
+    if (!parse_range_val (hdr, &rstart, &rend, &fsize)) {
+        seaf_warning ("Invalid Seafile-Content-Range value.\n");
+        err_msg = "Invalid Seafile-Content-Range";
+        goto err;
+    }
+
     fsm = g_new0 (RecvFSM, 1);
     fsm->boundary = boundary;
     fsm->repo_id = repo_id;
     fsm->user = user;
     fsm->token_type = token_type;
+    fsm->rstart = rstart;
+    fsm->rend = rend;
+    fsm->fsize = fsize;
     fsm->line = evbuffer_new ();
     fsm->form_kvs = g_hash_table_new_full (g_str_hash, g_str_equal,
                                            g_free, g_free);
